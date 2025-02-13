@@ -1,0 +1,10 @@
+OpencV-python
+Face-Recognition
+scikit-learn
+Numpy
+Streamlit
+imutils
+os
+time
+shutil
+tempfile
