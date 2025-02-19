@@ -1,10 +1,7 @@
-OpencV-python
-Face-Recognition
+streamlit
+opencv-python
+face-recognition
+numpy
 scikit-learn
-Numpy
-Streamlit
 imutils
-os
-time
 shutil
-tempfile

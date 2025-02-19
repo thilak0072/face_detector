@@ -1,6 +1,5 @@
 import os
 import shutil
-import tempfile
 import numpy as np
 import cv2
 import face_recognition
@@ -9,108 +8,116 @@ from imutils import build_montages
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-import io
-from zipfile import ZipFile
-
+from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
 UPLOAD_DIR = "uploads"
+STATIC_DIR = "static"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(STATIC_DIR, exist_ok=True)
 
-# Endpoint to handle image uploads and perform face clustering
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
 @app.post("/upload-images/")
 async def upload_images(files: list[UploadFile] = File(...)):
-    # Save uploaded files to the disk
+    """Handles image uploads and performs face clustering."""
     file_paths = []
+
+    
     for file in files:
         file_location = os.path.join(UPLOAD_DIR, file.filename)
         with open(file_location, "wb") as f:
             f.write(file.file.read())
         file_paths.append(file_location)
 
-    # Process uploaded images
+    # Face encoding and clustering
     data = []
     for file_path in file_paths:
         image = cv2.imread(file_path)
         rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        boxes = face_recognition.face_locations(rgb, model="cnn")
+        boxes = face_recognition.face_locations(rgb, model="hog")  # Faster than "cnn"
         encodings = face_recognition.face_encodings(rgb, boxes)
-        d = [{"imagePath": file_path, "loc": box, "encoding": enc} for (box, enc) in zip(boxes, encodings)]
-        data.extend(d)
 
-    # Converting the data into a numpy array
-    data_arr = np.array(data)
-    # Extracting the 128-d facial encodings
-    encodings_arr = [item["encoding"] for item in data_arr]
+        for (box, enc) in zip(boxes, encodings):
+            data.append({"imagePath": file_path, "loc": box, "encoding": enc})
+
+    if not data:
+        raise HTTPException(status_code=400, detail="No faces detected.")
+
+    # Convert data into a numpy array
+    encodings_arr = np.array([d["encoding"] for d in data])
 
     # Clustering with DBSCAN
-    cluster = DBSCAN(min_samples=3)
-    cluster.fit(encodings_arr)
-
+    cluster = DBSCAN(min_samples=3, metric="euclidean").fit(encodings_arr)
     labelIDs = np.unique(cluster.labels_)
-    numUniqueFaces = len(np.where(labelIDs > -1)[0])
+    num_unique_faces = len(labelIDs[labelIDs != -1])  # Ignore noise (-1)
 
-    # Prepare for returning the results
-    response = {"numUniqueFaces": numUniqueFaces, "faces": []}
+    response = {"numUniqueFaces": num_unique_faces, "faces": []}
 
+    # Process each cluster (skip labelID == -1 which represents noise)
     for labelID in labelIDs:
+        if labelID == -1:
+            continue
+
         idxs = np.where(cluster.labels_ == labelID)[0]
         idxs = np.random.choice(idxs, size=min(15, len(idxs)), replace=False)
         faces = []
-        whole_images = []
 
-        if labelID != -1:
-            dir_name = f'face#{labelID + 1}'
-            os.makedirs(dir_name, exist_ok=True)
+        dir_name = os.path.join(STATIC_DIR, f'face_group_{labelID + 1}')
+        os.makedirs(dir_name, exist_ok=True)
 
         for i in idxs:
-            current_image = cv2.imread(data_arr[i]["imagePath"])
-            rgb_current_image = cv2.cvtColor(current_image, cv2.COLOR_BGR2RGB)
-            (top, right, bottom, left) = data_arr[i]["loc"]
-            current_face = rgb_current_image[top:bottom, left:right]
-            current_face = cv2.resize(current_face, (96, 96))
-            whole_images.append(rgb_current_image)
-            faces.append(current_face)
+            data_point = data[i]
+            image = cv2.imread(data_point["imagePath"])
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            (top, right, bottom, left) = data_point["loc"]
+            face = rgb_image[top:bottom, left:right]
+            face = cv2.resize(face, (96, 96))
+            faces.append(face)
 
-            if labelID != -1:
-                face_image_name = f'image{i}.jpg'
-                cv2.imwrite(os.path.join(dir_name, face_image_name), current_image)
-
-        if labelID != -1:
-            zip_filename = f'zip_face#{labelID + 1}.zip'
-            shutil.make_archive(zip_filename.replace('.zip', ''), 'zip', dir_name)
-            shutil.rmtree(dir_name) 
+            
+            face_image_path = os.path.join(dir_name, f"face_{i}.jpg")
+            cv2.imwrite(face_image_path, image)
 
         
-            response["faces"].append({
-                "faceID": labelID + 1,
-                "zipFile": f"/static/{zip_filename}" 
-            })
+        zip_filename = f'face_group_{labelID + 1}.zip'
+        zip_path = os.path.join(STATIC_DIR, zip_filename)
+        shutil.make_archive(zip_path.replace('.zip', ''), 'zip', dir_name)
+        shutil.rmtree(dir_name)  
 
-        
-        montage = build_montages(faces, (96, 96), (2, 2))[0]
-        response["faces"][-1]["montage"] = montage.tolist()  
+    
+        montage = build_montages(faces, (96, 96), (2, 2))[0] if faces else None
+
+        response["faces"].append({
+            "faceID": labelID + 1,
+            "zipFile": f"/static/{zip_filename}",
+            "montage": montage.tolist() if montage is not None else None
+        })
 
     return response
 
-# Endpoint to serve a zip file (for downloading)
+
 @app.get("/download/{file_name}")
 async def download_file(file_name: str):
-    file_path = os.path.join(UPLOAD_DIR, file_name)
+    """Endpoint to download grouped face images as ZIP."""
+    file_path = os.path.join(STATIC_DIR, file_name)
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(file_path)
+    return FileResponse(file_path, filename=file_name)
 
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 def home():
+    """Basic HTML upload form."""
     return """
     <html>
-        <head><title>Face Clustering</title></head>
+        <head>
+            <title>Face Clustering</title>
+        </head>
         <body>
             <h1>Upload your images for face clustering</h1>
             <form action="/upload-images/" method="post" enctype="multipart/form-data">
@@ -120,4 +127,3 @@ def home():
         </body>
     </html>
     """
-
