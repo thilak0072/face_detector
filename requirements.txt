@@ -4,4 +4,3 @@ face-recognition
 numpy
 scikit-learn
 imutils
-shutil
